@@ -8,6 +8,7 @@
 
 import Foundation
 import MediaPlayer
+import AVFoundation
 import SwiftAudioEx
 
 @objc(RNTrackPlayer)
@@ -26,6 +27,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
     private var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
+    // Store prepared player items to prevent them from being deallocated during async loading
+    // Using AVPlayerItem instead of AVURLAsset ensures the loading isn't cancelled
+    private var preparedPlayerItems: [String: AVPlayerItem] = [:]
 
     // MARK: - Lifecycle Methods
 
@@ -315,7 +319,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     @objc(isServiceRunning:rejecter:)
     public func isServiceRunning(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         // TODO That is probably always true
-        resolve(player != nil)
+        resolve(hasInitialized)
     }
 
     @objc(updateOptions:resolver:rejecter:)
@@ -389,6 +393,141 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         resolve(index)
     }
 
+    @objc(addAndPrepare:before:resolver:rejecter:)
+    public func addAndPrepare(
+        trackDicts: [[String: Any]],
+        before trackIndex: NSNumber,
+        resolve: RCTPromiseResolveBlock,
+        reject: RCTPromiseRejectBlock
+    ) {
+        print("[RNTrackPlayer] addAndPrepare: Starting - adding \(trackDicts.count) track(s)")
+        
+        // -1 means no index was passed and therefore should be inserted at the end.
+        let index = trackIndex.intValue == -1 ? player.items.count : trackIndex.intValue;
+        print("[RNTrackPlayer] addAndPrepare: Insertion index: \(index), current queue size: \(player.items.count)")
+        
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+        if (rejectWhenTrackIndexOutOfBounds(
+            index: index,
+            max: player.items.count,
+            reject: reject
+        )) { return }
+
+        var tracks = [Track]()
+        var playerItemsToPrepare: [AVPlayerItem] = []
+        
+        for (idx, trackDict) in trackDicts.enumerated() {
+            guard let track = Track(dictionary: trackDict) else {
+                print("[RNTrackPlayer] addAndPrepare: ❌ Failed to create track at index \(idx)")
+                reject("invalid_track_object", "Track is missing a required key", nil)
+                return
+            }
+
+            tracks.append(track)
+            
+            // Create AVPlayerItem for pre-buffering
+            // Using AVPlayerItem instead of AVURLAsset ensures AVFoundation doesn't cancel
+            // the loading, as it sees the item as actively being used
+            let sourceUrl = track.getSourceUrl()
+            print("[RNTrackPlayer] addAndPrepare: Processing track \(idx + 1)/\(trackDicts.count) - URL: \(sourceUrl), isLocal: \(track.url.isLocal)")
+            
+            if track.url.isLocal {
+                // For local files, use the file URL directly
+                let asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
+                let playerItem = AVPlayerItem(asset: asset)
+                playerItemsToPrepare.append(playerItem)
+                print("[RNTrackPlayer] addAndPrepare: Created AVPlayerItem for local file: \(track.url.value.absoluteString)")
+            } else {
+                // For remote URLs, create asset from the source URL string
+                if let url = URL(string: sourceUrl) {
+                    let asset = AVURLAsset(url: url, options: track.getAssetOptions())
+                    let playerItem = AVPlayerItem(asset: asset)
+                    playerItemsToPrepare.append(playerItem)
+                    print("[RNTrackPlayer] addAndPrepare: Created AVPlayerItem for remote URL: \(url.absoluteString)")
+                } else {
+                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Failed to create URL from sourceUrl: \(sourceUrl)")
+                }
+            }
+        }
+
+        print("[RNTrackPlayer] addAndPrepare: Created \(playerItemsToPrepare.count) player item(s) to prepare, adding \(tracks.count) track(s) to queue")
+
+        // Add tracks to the queue first
+        do {
+            try player.add(
+                items: tracks,
+                at: index
+            )
+            print("[RNTrackPlayer] addAndPrepare: ✅ Tracks added to queue successfully")
+        } catch {
+            print("[RNTrackPlayer] addAndPrepare: ❌ Failed to add tracks to queue: \(error.localizedDescription)")
+        }
+        
+        // Prepare player items asynchronously to trigger pre-buffering
+        // This will download and buffer the tracks in the background
+        // AVFoundation will cache the underlying assets, so when SwiftAudioEx creates
+        // AVPlayerItems for the same URLs, they'll benefit from the pre-buffering
+        for (idx, playerItem) in playerItemsToPrepare.enumerated() {
+            let trackIndex = index + idx
+            guard let asset = playerItem.asset as? AVURLAsset else {
+                print("[RNTrackPlayer] addAndPrepare: ⚠️ Player item at index \(idx) does not have AVURLAsset, skipping")
+                continue
+            }
+            let assetKey = asset.url.absoluteString
+            
+            // Store the player item to prevent deallocation during async loading
+            // This ensures AVFoundation doesn't cancel the loading
+            let previousItem = preparedPlayerItems[assetKey]
+            preparedPlayerItems[assetKey] = playerItem
+            print("[RNTrackPlayer] addAndPrepare: Stored player item for track at index \(trackIndex) (key: \(assetKey))")
+            if previousItem != nil {
+                print("[RNTrackPlayer] addAndPrepare: ⚠️ Replaced existing prepared player item for key: \(assetKey)")
+            }
+            
+            print("[RNTrackPlayer] addAndPrepare: Starting async load for track at index \(trackIndex): \(asset.url)")
+            print("[RNTrackPlayer] addAndPrepare: Current preparedPlayerItems count: \(preparedPlayerItems.count)")
+            
+            // Prepare the player item by loading its asset values
+            asset.loadValuesAsynchronously(forKeys: ["tracks", "duration", "playable"]) {
+                var error: NSError?
+                let tracksStatus = asset.statusOfValue(forKey: "tracks", error: &error)
+                let durationStatus = asset.statusOfValue(forKey: "duration", error: &error)
+                let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
+                
+                print("[RNTrackPlayer] addAndPrepare: Async load completed for track at index \(trackIndex)")
+                print("[RNTrackPlayer] addAndPrepare:   - tracks status: \(tracksStatus.rawValue)")
+                print("[RNTrackPlayer] addAndPrepare:   - duration status: \(durationStatus.rawValue)")
+                print("[RNTrackPlayer] addAndPrepare:   - playable status: \(playableStatus.rawValue)")
+                
+                if playableStatus == .loaded {
+                    print("[RNTrackPlayer] addAndPrepare: ✅ Track at index \(trackIndex) pre-buffered successfully")
+                    // Get duration using the older synchronous API for compatibility
+                    if durationStatus == .loaded {
+                        let duration = asset.duration
+                        if !CMTIME_IS_INDEFINITE(duration) && !CMTIME_IS_INVALID(duration) {
+                            print("[RNTrackPlayer] addAndPrepare:   - Duration: \(CMTimeGetSeconds(duration)) seconds")
+                        }
+                    }
+                } else if let error = error {
+                    print("[RNTrackPlayer] addAndPrepare: ❌ Track at index \(trackIndex) pre-buffering error: \(error.localizedDescription)")
+                    print("[RNTrackPlayer] addAndPrepare:   - Error domain: \(error.domain), code: \(error.code)")
+                } else {
+                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Track at index \(trackIndex) playable status is not loaded: \(playableStatus.rawValue)")
+                }
+                
+                // Check if player item is still retained
+                if self.preparedPlayerItems[assetKey] === playerItem {
+                    print("[RNTrackPlayer] addAndPrepare: Player item for track at index \(trackIndex) is still retained")
+                } else {
+                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Player item for track at index \(trackIndex) was deallocated or replaced!")
+                }
+            }
+        }
+        
+        print("[RNTrackPlayer] addAndPrepare: Method returning, resolved with index: \(index)")
+        resolve(index)
+    }
+
     @objc(load:resolver:rejecter:)
     public func load(
         trackDict: [String: Any],
@@ -418,6 +557,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         // Sort the indexes in descending order so we can safely remove them one by one
         // without having the next index possibly newly pointing to another item than intended:
         for index in indexes.sorted().reversed() {
+            // Clean up prepared player items for removed tracks
+            if index < player.items.count, let track = player.items[index] as? Track {
+                let assetKey = track.url.value.absoluteString
+                if preparedPlayerItems.removeValue(forKey: assetKey) != nil {
+                    print("[RNTrackPlayer] remove: Cleaned up prepared player item for track at index \(index) (key: \(assetKey))")
+                }
+            }
             try? player.removeItem(at: index)
         }
 
@@ -519,8 +665,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func reset(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        print("[RNTrackPlayer] reset: Cleaning up \(preparedPlayerItems.count) prepared player item(s)")
         player.stop()
         player.clear()
+        // Clean up all prepared player items
+        preparedPlayerItems.removeAll()
+        print("[RNTrackPlayer] reset: ✅ All prepared player items cleaned up")
         resolve(NSNull())
     }
 
@@ -921,4 +1071,18 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             ]
         )
     }
+    
+    // MARK: - Test Helpers
+    
+    #if DEBUG
+    /// Test helper to get the count of prepared player items
+    /// This is only available in DEBUG builds for testing purposes
+    @objc(getPreparedPlayerItemsCount:rejecter:)
+    public func getPreparedPlayerItemsCount(
+        resolve: RCTPromiseResolveBlock,
+        reject: RCTPromiseRejectBlock
+    ) {
+        resolve(preparedPlayerItems.count)
+    }
+    #endif
 }

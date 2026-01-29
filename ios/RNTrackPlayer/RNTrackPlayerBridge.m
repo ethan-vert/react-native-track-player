@@ -27,6 +27,11 @@ RCT_EXTERN_METHOD(add:(NSArray *)objects
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject);
 
+RCT_EXTERN_METHOD(addAndPrepare:(NSArray *)objects
+                  before:(nonnull NSNumber *)trackIndex
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject);
+
 RCT_EXTERN_METHOD(move:(nonnull NSNumber *)fromIndex
                   toIndex:(nonnull NSNumber *)toIndex
                   resolver:(RCTPromiseResolveBlock)resolve

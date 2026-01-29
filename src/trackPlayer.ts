@@ -131,6 +131,61 @@ export async function add(
 }
 
 /**
+ * Adds one or more tracks to the queue and pre-buffers them for seamless playback.
+ * This method is iOS-only and will pre-download/prepare tracks in the background.
+ *
+ * @param tracks The tracks to add to the queue.
+ * @param insertBeforeIndex (Optional) The index to insert the tracks before.
+ * By default the tracks will be added to the end of the queue.
+ */
+export async function addAndPrepare(
+  tracks: AddTrack[],
+  insertBeforeIndex?: number
+): Promise<number | void>;
+/**
+ * Adds a track to the queue and pre-buffers it for seamless playback.
+ * This method is iOS-only and will pre-download/prepare the track in the background.
+ *
+ * @param track The track to add to the queue.
+ * @param insertBeforeIndex (Optional) The index to insert the track before.
+ * By default the track will be added to the end of the queue.
+ */
+export async function addAndPrepare(
+  track: AddTrack,
+  insertBeforeIndex?: number
+): Promise<number | void>;
+export async function addAndPrepare(
+  tracks: AddTrack | AddTrack[],
+  insertBeforeIndex = -1
+): Promise<number | void> {
+  const resolvedTracks = (Array.isArray(tracks) ? tracks : [tracks]).map(
+    (track) => ({
+      ...track,
+      url: resolveImportedAssetOrPath(track.url),
+      artwork: resolveImportedAssetOrPath(track.artwork),
+    })
+  );
+  
+  if (__DEV__) {
+    console.log(
+      `[TrackPlayer] addAndPrepare: Adding ${resolvedTracks.length} track(s) with pre-buffering`
+    );
+  }
+  
+  const result = resolvedTracks.length < 1
+    ? undefined
+    : TrackPlayer.addAndPrepare(resolvedTracks, insertBeforeIndex);
+    
+  if (__DEV__ && resolvedTracks.length > 0) {
+    console.log(
+      `[TrackPlayer] addAndPrepare: Tracks added. Pre-buffering started in background.`
+    );
+  }
+  
+  return result;
+}
+
+/**
  * Replaces the current track or loads the track as the first in the queue.
  *
  * @param track The track to load.
