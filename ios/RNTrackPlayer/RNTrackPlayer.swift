@@ -418,7 +418,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         )) { return }
 
         var tracks = [Track]()
-        var playerItemsToPrepare: [AVPlayerItem] = []
         
         for (idx, trackDict) in trackDicts.enumerated() {
             guard let track = Track(dictionary: trackDict) else {
@@ -427,36 +426,79 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 return
             }
 
-            tracks.append(track)
-            
             // Create AVPlayerItem for pre-buffering
-            // Using AVPlayerItem instead of AVURLAsset ensures AVFoundation doesn't cancel
-            // the loading, as it sees the item as actively being used
             let sourceUrl = track.getSourceUrl()
             print("[RNTrackPlayer] addAndPrepare: Processing track \(idx + 1)/\(trackDicts.count) - URL: \(sourceUrl), isLocal: \(track.url.isLocal)")
             
+            let asset: AVURLAsset
+            let cacheKey: String
+            
             if track.url.isLocal {
-                // For local files, use the file URL directly
-                let asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
-                let playerItem = AVPlayerItem(asset: asset)
-                playerItemsToPrepare.append(playerItem)
-                print("[RNTrackPlayer] addAndPrepare: Created AVPlayerItem for local file: \(track.url.value.absoluteString)")
+                asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
+                cacheKey = track.url.value.absoluteString
+                print("[RNTrackPlayer] addAndPrepare: Created AVURLAsset for local file")
+            } else if let url = URL(string: sourceUrl) {
+                asset = AVURLAsset(url: url, options: track.getAssetOptions())
+                cacheKey = url.absoluteString
+                print("[RNTrackPlayer] addAndPrepare: Created AVURLAsset for remote URL")
             } else {
-                // For remote URLs, create asset from the source URL string
-                if let url = URL(string: sourceUrl) {
-                    let asset = AVURLAsset(url: url, options: track.getAssetOptions())
-                    let playerItem = AVPlayerItem(asset: asset)
-                    playerItemsToPrepare.append(playerItem)
-                    print("[RNTrackPlayer] addAndPrepare: Created AVPlayerItem for remote URL: \(url.absoluteString)")
+                print("[RNTrackPlayer] addAndPrepare: ⚠️ Failed to create URL from sourceUrl: \(sourceUrl)")
+                tracks.append(track)
+                continue
+            }
+            
+            // Create AVPlayerItem and store in cache
+            let playerItem = AVPlayerItem(asset: asset)
+            
+            // Store in global cache (used by patched AVPlayerWrapper via Obj-C runtime)
+            PreparedPlayerItemCache.shared.store(playerItem, forURL: cacheKey)
+            
+            // Also store in local dictionary for retention during async loading
+            preparedPlayerItems[cacheKey] = playerItem
+            
+            tracks.append(track)
+            
+            // Start async loading for pre-buffering
+            print("[RNTrackPlayer] addAndPrepare: Starting async load for track \(idx): \(cacheKey)")
+            
+            asset.loadValuesAsynchronously(forKeys: ["tracks", "duration", "playable"]) {
+                var error: NSError?
+                let tracksStatus = asset.statusOfValue(forKey: "tracks", error: &error)
+                let durationStatus = asset.statusOfValue(forKey: "duration", error: &error)
+                let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
+                
+                print("[RNTrackPlayer] addAndPrepare: Async load completed for track \(idx)")
+                print("[RNTrackPlayer] addAndPrepare:   - tracks status: \(tracksStatus.rawValue)")
+                print("[RNTrackPlayer] addAndPrepare:   - duration status: \(durationStatus.rawValue)")
+                print("[RNTrackPlayer] addAndPrepare:   - playable status: \(playableStatus.rawValue)")
+                
+                if playableStatus == .loaded {
+                    print("[RNTrackPlayer] addAndPrepare: ✅ Track \(idx) pre-buffered successfully")
+                    if durationStatus == .loaded {
+                        let duration = asset.duration
+                        if !CMTIME_IS_INDEFINITE(duration) && !CMTIME_IS_INVALID(duration) {
+                            print("[RNTrackPlayer] addAndPrepare:   - Duration: \(CMTimeGetSeconds(duration)) seconds")
+                        }
+                    }
+                    // Check buffer status
+                    DispatchQueue.main.async {
+                        let loadedRanges = playerItem.loadedTimeRanges
+                        if let firstRange = loadedRanges.first?.timeRangeValue {
+                            let bufferedSeconds = CMTimeGetSeconds(firstRange.duration)
+                            print("[RNTrackPlayer] addAndPrepare:   - Buffered: \(bufferedSeconds) seconds")
+                        }
+                    }
+                } else if let error = error {
+                    print("[RNTrackPlayer] addAndPrepare: ❌ Track \(idx) pre-buffering error: \(error.localizedDescription)")
                 } else {
-                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Failed to create URL from sourceUrl: \(sourceUrl)")
+                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Track \(idx) playable status not loaded: \(playableStatus.rawValue)")
                 }
             }
         }
 
-        print("[RNTrackPlayer] addAndPrepare: Created \(playerItemsToPrepare.count) player item(s) to prepare, adding \(tracks.count) track(s) to queue")
+        print("[RNTrackPlayer] addAndPrepare: Adding \(tracks.count) track(s) to queue")
 
-        // Add tracks to the queue first
+        // Add tracks to the queue
         do {
             try player.add(
                 items: tracks,
@@ -465,67 +507,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             print("[RNTrackPlayer] addAndPrepare: ✅ Tracks added to queue successfully")
         } catch {
             print("[RNTrackPlayer] addAndPrepare: ❌ Failed to add tracks to queue: \(error.localizedDescription)")
-        }
-        
-        // Prepare player items asynchronously to trigger pre-buffering
-        // This will download and buffer the tracks in the background
-        // AVFoundation will cache the underlying assets, so when SwiftAudioEx creates
-        // AVPlayerItems for the same URLs, they'll benefit from the pre-buffering
-        for (idx, playerItem) in playerItemsToPrepare.enumerated() {
-            let trackIndex = index + idx
-            guard let asset = playerItem.asset as? AVURLAsset else {
-                print("[RNTrackPlayer] addAndPrepare: ⚠️ Player item at index \(idx) does not have AVURLAsset, skipping")
-                continue
-            }
-            let assetKey = asset.url.absoluteString
-            
-            // Store the player item to prevent deallocation during async loading
-            // This ensures AVFoundation doesn't cancel the loading
-            let previousItem = preparedPlayerItems[assetKey]
-            preparedPlayerItems[assetKey] = playerItem
-            print("[RNTrackPlayer] addAndPrepare: Stored player item for track at index \(trackIndex) (key: \(assetKey))")
-            if previousItem != nil {
-                print("[RNTrackPlayer] addAndPrepare: ⚠️ Replaced existing prepared player item for key: \(assetKey)")
-            }
-            
-            print("[RNTrackPlayer] addAndPrepare: Starting async load for track at index \(trackIndex): \(asset.url)")
-            print("[RNTrackPlayer] addAndPrepare: Current preparedPlayerItems count: \(preparedPlayerItems.count)")
-            
-            // Prepare the player item by loading its asset values
-            asset.loadValuesAsynchronously(forKeys: ["tracks", "duration", "playable"]) {
-                var error: NSError?
-                let tracksStatus = asset.statusOfValue(forKey: "tracks", error: &error)
-                let durationStatus = asset.statusOfValue(forKey: "duration", error: &error)
-                let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
-                
-                print("[RNTrackPlayer] addAndPrepare: Async load completed for track at index \(trackIndex)")
-                print("[RNTrackPlayer] addAndPrepare:   - tracks status: \(tracksStatus.rawValue)")
-                print("[RNTrackPlayer] addAndPrepare:   - duration status: \(durationStatus.rawValue)")
-                print("[RNTrackPlayer] addAndPrepare:   - playable status: \(playableStatus.rawValue)")
-                
-                if playableStatus == .loaded {
-                    print("[RNTrackPlayer] addAndPrepare: ✅ Track at index \(trackIndex) pre-buffered successfully")
-                    // Get duration using the older synchronous API for compatibility
-                    if durationStatus == .loaded {
-                        let duration = asset.duration
-                        if !CMTIME_IS_INDEFINITE(duration) && !CMTIME_IS_INVALID(duration) {
-                            print("[RNTrackPlayer] addAndPrepare:   - Duration: \(CMTimeGetSeconds(duration)) seconds")
-                        }
-                    }
-                } else if let error = error {
-                    print("[RNTrackPlayer] addAndPrepare: ❌ Track at index \(trackIndex) pre-buffering error: \(error.localizedDescription)")
-                    print("[RNTrackPlayer] addAndPrepare:   - Error domain: \(error.domain), code: \(error.code)")
-                } else {
-                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Track at index \(trackIndex) playable status is not loaded: \(playableStatus.rawValue)")
-                }
-                
-                // Check if player item is still retained
-                if self.preparedPlayerItems[assetKey] === playerItem {
-                    print("[RNTrackPlayer] addAndPrepare: Player item for track at index \(trackIndex) is still retained")
-                } else {
-                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Player item for track at index \(trackIndex) was deallocated or replaced!")
-                }
-            }
         }
         
         print("[RNTrackPlayer] addAndPrepare: Method returning, resolved with index: \(index)")

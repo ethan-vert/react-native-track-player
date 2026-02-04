@@ -137,5 +137,5 @@ class Track: AudioItem, TimePitching, AssetOptionsProviding {
         }
         return options
     }
-
+    
 }
