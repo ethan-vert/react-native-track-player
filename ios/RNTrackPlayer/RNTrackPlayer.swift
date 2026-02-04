@@ -297,12 +297,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
 
     private func configureAudioSession() {
-
-        // deactivate the session when there is no current item to be played
-        if (player.currentItem == nil) {
-            try? audioSessionController.deactivateSession()
-            return
-        }
+        // IMPORTANT: Do NOT deactivate the audio session when currentItem is nil.
+        // This happens briefly during chunk transitions (queue ends, next chunk loading).
+        // If we deactivate, iOS sees "no audio session" and may terminate the app in background.
+        // The session will naturally be released when the app is fully terminated.
+        // 
+        // Previous code that caused background termination:
+        // if (player.currentItem == nil) {
+        //     try? audioSessionController.deactivateSession()
+        //     return
+        // }
         
         // activate the audio session when there is an item to be played
         // and the player has been configured to start when it is ready loading:
@@ -1005,15 +1009,23 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 let isTrackLiveStream = (item as? Track)?.isLiveStream ?? false
                 self.player.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
             }
-        } else {
-            DispatchQueue.main.async {
-                UIApplication.shared.endReceivingRemoteControlEvents();
-            }
         }
+        // IMPORTANT: Do NOT call endReceivingRemoteControlEvents when item becomes nil.
+        // This happens during chunk transitions and signals iOS we're done with audio,
+        // which can cause background termination. Keep receiving remote control events
+        // so lock screen controls continue to work during chunk loading.
+        // 
+        // Previous code that caused issues:
+        // else {
+        //     DispatchQueue.main.async {
+        //         UIApplication.shared.endReceivingRemoteControlEvents();
+        //     }
+        // }
 
-        if ((item != nil && lastItem == nil) || item == nil) {
+        if (item != nil && lastItem == nil) {
             configureAudioSession();
         }
+        // Don't call configureAudioSession when item becomes nil - it would deactivate the session
 
         var a: Dictionary<String, Any> = ["lastPosition": lastPosition ?? 0]
         if let lastIndex = lastIndex {
