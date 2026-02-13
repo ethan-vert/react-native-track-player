@@ -30,6 +30,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     // Store prepared player items to prevent them from being deallocated during async loading
     // Using AVPlayerItem instead of AVURLAsset ensures the loading isn't cancelled
     private var preparedPlayerItems: [String: AVPlayerItem] = [:]
+    // Hidden warmup players that drive network reads for upcoming stream-chunk items.
+    private var streamWarmupPlayers: [String: AVPlayer] = [:]
+    private var streamWarmupStartTimes: [String: Date] = [:]
+    private let streamWarmupTargetSeconds: Double = 1.5
+    private let streamWarmupPollIntervalSeconds: Double = 0.25
+    private let streamWarmupMaxWaitSeconds: Double = 25.0
 
     // MARK: - Lifecycle Methods
 
@@ -37,6 +43,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
         audioSessionController.delegate = self
+        PreparedPlayerItemCache.beforeRetrieve = { [weak self] url in
+            _ = self?.detachStreamWarmupBestEffort(for: url, reason: "handoff")
+        }
         player.playWhenReady = false;
         player.event.receiveChapterMetadata.addListener(self, handleAudioPlayerChapterMetadataReceived)
         player.event.receiveTimedMetadata.addListener(self, handleAudioPlayerTimedMetadataReceived)
@@ -49,6 +58,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     }
 
     deinit {
+        PreparedPlayerItemCache.beforeRetrieve = nil
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
@@ -404,11 +414,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         resolve: RCTPromiseResolveBlock,
         reject: RCTPromiseRejectBlock
     ) {
-        print("[RNTrackPlayer] addAndPrepare: Starting - adding \(trackDicts.count) track(s)")
-        
         // -1 means no index was passed and therefore should be inserted at the end.
         let index = trackIndex.intValue == -1 ? player.items.count : trackIndex.intValue;
-        print("[RNTrackPlayer] addAndPrepare: Insertion index: \(index), current queue size: \(player.items.count)")
         
         if (rejectWhenNotInitialized(reject: reject)) { return }
         if (rejectWhenTrackIndexOutOfBounds(
@@ -421,14 +428,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         
         for (idx, trackDict) in trackDicts.enumerated() {
             guard let track = Track(dictionary: trackDict) else {
-                print("[RNTrackPlayer] addAndPrepare: ❌ Failed to create track at index \(idx)")
+                print("[TrackPlayer] addAndPrepare: ❌ Failed to create track at index \(idx)")
                 reject("invalid_track_object", "Track is missing a required key", nil)
                 return
             }
 
-            // Create AVPlayerItem for pre-buffering
             let sourceUrl = track.getSourceUrl()
-            print("[RNTrackPlayer] addAndPrepare: Processing track \(idx + 1)/\(trackDicts.count) - URL: \(sourceUrl), isLocal: \(track.url.isLocal)")
             
             let asset: AVURLAsset
             let cacheKey: String
@@ -436,67 +441,93 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             if track.url.isLocal {
                 asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
                 cacheKey = track.url.value.absoluteString
-                print("[RNTrackPlayer] addAndPrepare: Created AVURLAsset for local file")
             } else if let url = URL(string: sourceUrl) {
                 asset = AVURLAsset(url: url, options: track.getAssetOptions())
                 cacheKey = url.absoluteString
-                print("[RNTrackPlayer] addAndPrepare: Created AVURLAsset for remote URL")
             } else {
-                print("[RNTrackPlayer] addAndPrepare: ⚠️ Failed to create URL from sourceUrl: \(sourceUrl)")
+                print("[TrackPlayer] addAndPrepare: ⚠️ Invalid URL: \(sourceUrl)")
                 tracks.append(track)
                 continue
             }
             
-            // Create AVPlayerItem and store in cache
+            // Create AVPlayerItem and store in cache for the patched AVPlayerWrapper
             let playerItem = AVPlayerItem(asset: asset)
-            
-            // Store in global cache (used by patched AVPlayerWrapper via Obj-C runtime)
             PreparedPlayerItemCache.shared.store(playerItem, forURL: cacheKey)
-            
-            // Also store in local dictionary for retention during async loading
             preparedPlayerItems[cacheKey] = playerItem
-            
+
+            // Determine URL type for logging
+            let isStreamChunk = sourceUrl.contains("/stream-chunk/")
+            let urlType = isStreamChunk ? "stream-chunk" : (track.url.isLocal ? "local" : "remote")
+            let trackInsertionIndex = index + tracks.count
             tracks.append(track)
+
+            // CRITICAL: Do not preflight-probe stream-chunk URLs here.
+            // loadValuesAsynchronously can trigger a second GET /stream-chunk/* request
+            // for the same chunk, which causes duplicate generation and unstable playback.
+            if isStreamChunk {
+                let currentIndex = player.currentIndex
+                let shouldWarm = currentIndex >= 0 && trackInsertionIndex > currentIndex
+                if shouldWarm {
+                    // Use a separate AVPlayerItem for warmup so the cached playback
+                    // item is never attached to more than one AVPlayer.
+                    let warmupItem = AVPlayerItem(asset: asset)
+                    startStreamWarmup(
+                        cacheKey: cacheKey,
+                        item: warmupItem,
+                        trackIndex: trackInsertionIndex
+                    )
+                }
+                print(
+                    "[TrackPlayer] addAndPrepare: ℹ️ [stream-chunk] track \(trackInsertionIndex) queued " +
+                    "(probe skipped, warmup=\(shouldWarm ? "on" : "off"))"
+                )
+                continue
+            }
             
-            // Start async loading for pre-buffering
-            print("[RNTrackPlayer] addAndPrepare: Starting async load for track \(idx): \(cacheKey)")
-            
-            asset.loadValuesAsynchronously(forKeys: ["tracks", "duration", "playable"]) {
+            // Pre-buffer: load playable + duration asynchronously.
+            // For stream-chunk URLs the backend may return a 302→S3 or a progressive
+            // stream — AVURLAsset handles both. Duration may be unknown until the
+            // full response is received; that is fine — playback starts as soon as
+            // enough data is buffered.
+            asset.loadValuesAsynchronously(forKeys: ["playable", "duration"]) { [weak self] in
                 var error: NSError?
-                let tracksStatus = asset.statusOfValue(forKey: "tracks", error: &error)
-                let durationStatus = asset.statusOfValue(forKey: "duration", error: &error)
                 let playableStatus = asset.statusOfValue(forKey: "playable", error: &error)
-                
-                print("[RNTrackPlayer] addAndPrepare: Async load completed for track \(idx)")
-                print("[RNTrackPlayer] addAndPrepare:   - tracks status: \(tracksStatus.rawValue)")
-                print("[RNTrackPlayer] addAndPrepare:   - duration status: \(durationStatus.rawValue)")
-                print("[RNTrackPlayer] addAndPrepare:   - playable status: \(playableStatus.rawValue)")
+                let durationStatus = asset.statusOfValue(forKey: "duration", error: &error)
                 
                 if playableStatus == .loaded {
-                    print("[RNTrackPlayer] addAndPrepare: ✅ Track \(idx) pre-buffered successfully")
+                    var durationStr = "unknown"
                     if durationStatus == .loaded {
-                        let duration = asset.duration
-                        if !CMTIME_IS_INDEFINITE(duration) && !CMTIME_IS_INVALID(duration) {
-                            print("[RNTrackPlayer] addAndPrepare:   - Duration: \(CMTimeGetSeconds(duration)) seconds")
+                        let dur = asset.duration
+                        if !CMTIME_IS_INDEFINITE(dur) && !CMTIME_IS_INVALID(dur) {
+                            durationStr = String(format: "%.1fs", CMTimeGetSeconds(dur))
+                        } else {
+                            // Duration indefinite — expected for progressive streams
+                            durationStr = "indefinite (streaming)"
                         }
                     }
-                    // Check buffer status
+                    
+                    // Single summary log per non-streaming track
                     DispatchQueue.main.async {
-                        let loadedRanges = playerItem.loadedTimeRanges
-                        if let firstRange = loadedRanges.first?.timeRangeValue {
-                            let bufferedSeconds = CMTimeGetSeconds(firstRange.duration)
-                            print("[RNTrackPlayer] addAndPrepare:   - Buffered: \(bufferedSeconds) seconds")
+                        let bufferedStr: String
+                        if let firstRange = playerItem.loadedTimeRanges.first?.timeRangeValue {
+                            bufferedStr = String(format: "%.1fs buffered", CMTimeGetSeconds(firstRange.duration))
+                        } else {
+                            bufferedStr = "0s buffered"
                         }
+                        print("[TrackPlayer] addAndPrepare: ✅ [\(urlType)] track \(idx) ready — \(durationStr), \(bufferedStr)")
                     }
                 } else if let error = error {
-                    print("[RNTrackPlayer] addAndPrepare: ❌ Track \(idx) pre-buffering error: \(error.localizedDescription)")
+                    print("[TrackPlayer] addAndPrepare: ❌ [\(urlType)] track \(idx) error: \(error.localizedDescription)")
                 } else {
-                    print("[RNTrackPlayer] addAndPrepare: ⚠️ Track \(idx) playable status not loaded: \(playableStatus.rawValue)")
+                    print("[TrackPlayer] addAndPrepare: ⚠️ [\(urlType)] track \(idx) playable=\(playableStatus.rawValue)")
+                }
+                
+                // Clean up local retention once loading completes
+                DispatchQueue.main.async {
+                    self?.preparedPlayerItems.removeValue(forKey: cacheKey)
                 }
             }
         }
-
-        print("[RNTrackPlayer] addAndPrepare: Adding \(tracks.count) track(s) to queue")
 
         // Add tracks to the queue
         do {
@@ -504,12 +535,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 items: tracks,
                 at: index
             )
-            print("[RNTrackPlayer] addAndPrepare: ✅ Tracks added to queue successfully")
+            print("[TrackPlayer] addAndPrepare: Adding \(tracks.count) track(s) at index \(index). Queue size: \(player.items.count)")
         } catch {
-            print("[RNTrackPlayer] addAndPrepare: ❌ Failed to add tracks to queue: \(error.localizedDescription)")
+            print("[TrackPlayer] addAndPrepare: ❌ Queue add failed: \(error.localizedDescription)")
         }
         
-        print("[RNTrackPlayer] addAndPrepare: Method returning, resolved with index: \(index)")
         resolve(index)
     }
 
@@ -548,6 +578,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 if preparedPlayerItems.removeValue(forKey: assetKey) != nil {
                     print("[RNTrackPlayer] remove: Cleaned up prepared player item for track at index \(index) (key: \(assetKey))")
                 }
+                PreparedPlayerItemCache.shared.remove(forURL: assetKey)
+                stopStreamWarmup(for: assetKey, reason: "removed")
             }
             try? player.removeItem(at: index)
         }
@@ -655,6 +687,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         player.clear()
         // Clean up all prepared player items
         preparedPlayerItems.removeAll()
+        PreparedPlayerItemCache.shared.clear()
+        stopAllStreamWarmups(reason: "reset")
         print("[RNTrackPlayer] reset: ✅ All prepared player items cleaned up")
         resolve(NSNull())
     }
@@ -899,6 +933,187 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         resolve(NSNull())
     }
 
+    private func warmupBufferedSeconds(for item: AVPlayerItem) -> Double {
+        guard let first = item.loadedTimeRanges.first?.timeRangeValue else { return 0.0 }
+        let value = CMTimeGetSeconds(first.duration)
+        return value.isFinite ? max(0.0, value) : 0.0
+    }
+
+    private func warmupTotalBufferedSeconds(for item: AVPlayerItem) -> Double {
+        item.loadedTimeRanges.reduce(0.0) { acc, rangeValue in
+            let value = CMTimeGetSeconds(rangeValue.timeRangeValue.duration)
+            if value.isFinite {
+                return acc + max(0.0, value)
+            }
+            return acc
+        }
+    }
+
+    private func startStreamWarmup(cacheKey: String, item: AVPlayerItem, trackIndex: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.streamWarmupPlayers[cacheKey] != nil {
+                return
+            }
+
+            item.preferredForwardBufferDuration = self.streamWarmupTargetSeconds
+            item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+
+            let warmer = AVPlayer(playerItem: item)
+            warmer.isMuted = true
+            warmer.automaticallyWaitsToMinimizeStalling = true
+            warmer.allowsExternalPlayback = false
+
+            self.streamWarmupPlayers[cacheKey] = warmer
+            self.streamWarmupStartTimes[cacheKey] = Date()
+
+            let shortKey = cacheKey.count > 70 ? String(cacheKey.prefix(70)) + "..." : cacheKey
+            print("[TrackPlayer] warmup: ▶️ start track \(trackIndex) url=\(shortKey)")
+            warmer.play()
+            self.pollStreamWarmup(cacheKey: cacheKey, trackIndex: trackIndex)
+        }
+    }
+
+    private func pollStreamWarmup(cacheKey: String, trackIndex: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + streamWarmupPollIntervalSeconds) { [weak self] in
+            guard let self = self else { return }
+            guard let warmer = self.streamWarmupPlayers[cacheKey], let item = warmer.currentItem else {
+                self.streamWarmupPlayers.removeValue(forKey: cacheKey)
+                self.streamWarmupStartTimes.removeValue(forKey: cacheKey)
+                return
+            }
+
+            let start = self.streamWarmupStartTimes[cacheKey] ?? Date()
+            let elapsed = Date().timeIntervalSince(start)
+            let firstBuffered = self.warmupBufferedSeconds(for: item)
+            let totalBuffered = self.warmupTotalBufferedSeconds(for: item)
+
+            if item.status == .failed {
+                self.stopStreamWarmup(for: cacheKey, reason: "failed", trackIndex: trackIndex)
+                return
+            }
+
+            if totalBuffered >= self.streamWarmupTargetSeconds {
+                print(
+                    "[TrackPlayer] warmup: ✅ primed track \(trackIndex) " +
+                    "elapsed=\(String(format: "%.2f", elapsed))s " +
+                    "first=\(String(format: "%.2f", firstBuffered))s total=\(String(format: "%.2f", totalBuffered))s"
+                )
+                return
+            }
+
+            if elapsed >= self.streamWarmupMaxWaitSeconds {
+                self.stopStreamWarmup(for: cacheKey, reason: "timeout", trackIndex: trackIndex)
+                return
+            }
+
+            if Int((elapsed * 10).rounded()) % 20 == 0 {
+                print(
+                    "[TrackPlayer] warmup: … track \(trackIndex) elapsed=\(String(format: "%.1f", elapsed))s " +
+                    "first=\(String(format: "%.2f", firstBuffered))s total=\(String(format: "%.2f", totalBuffered))s"
+                )
+            }
+
+            self.pollStreamWarmup(cacheKey: cacheKey, trackIndex: trackIndex)
+        }
+    }
+
+    @discardableResult
+    private func detachStreamWarmupImmediately(for cacheKey: String, reason: String, trackIndex: Int? = nil) -> Bool {
+        var didDetach = false
+        let detach = {
+            let start = self.streamWarmupStartTimes.removeValue(forKey: cacheKey)
+            guard let warmer = self.streamWarmupPlayers.removeValue(forKey: cacheKey) else {
+                let shortKey = cacheKey.count > 70 ? String(cacheKey.prefix(70)) + "..." : cacheKey
+                print("[TrackPlayer] warmup: ℹ️ no active warmup for reason=\(reason) key=\(shortKey)")
+                return
+            }
+
+            let elapsed = start.map { Date().timeIntervalSince($0) } ?? 0.0
+            let item = warmer.currentItem
+            let firstBuffered = item.map { self.warmupBufferedSeconds(for: $0) } ?? 0.0
+            let totalBuffered = item.map { self.warmupTotalBufferedSeconds(for: $0) } ?? 0.0
+            let statusRaw = item?.status.rawValue ?? -1
+
+            warmer.pause()
+            warmer.replaceCurrentItem(with: nil)
+
+            let idx = trackIndex.map(String.init) ?? "?"
+            print(
+                "[TrackPlayer] warmup: ⏹️ \(reason) track \(idx) " +
+                "elapsed=\(String(format: "%.2f", elapsed))s status=\(statusRaw) " +
+                "first=\(String(format: "%.2f", firstBuffered))s total=\(String(format: "%.2f", totalBuffered))s"
+            )
+            didDetach = true
+        }
+
+        if Thread.isMainThread {
+            detach()
+        } else {
+            DispatchQueue.main.sync(execute: detach)
+        }
+        return didDetach
+    }
+
+    private func normalizedWarmupKey(_ value: String) -> String {
+        if let parts = value.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first {
+            return String(parts)
+        }
+        return value
+    }
+
+    @discardableResult
+    private func detachStreamWarmupBestEffort(for cacheKey: String, reason: String, trackIndex: Int? = nil) -> Bool {
+        if detachStreamWarmupImmediately(for: cacheKey, reason: reason, trackIndex: trackIndex) {
+            return true
+        }
+
+        let target = normalizedWarmupKey(cacheKey)
+        var matchedKey: String?
+        let locate = {
+            matchedKey = self.streamWarmupPlayers.keys.first(where: {
+                self.normalizedWarmupKey($0) == target
+            })
+        }
+
+        if Thread.isMainThread {
+            locate()
+        } else {
+            DispatchQueue.main.sync(execute: locate)
+        }
+
+        guard let key = matchedKey else {
+            return false
+        }
+        return detachStreamWarmupImmediately(
+            for: key,
+            reason: "\(reason)-normalized",
+            trackIndex: trackIndex
+        )
+    }
+
+    private func stopStreamWarmup(for cacheKey: String, reason: String, trackIndex: Int? = nil) {
+        _ = detachStreamWarmupImmediately(for: cacheKey, reason: reason, trackIndex: trackIndex)
+    }
+
+    private func stopAllStreamWarmups(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.streamWarmupPlayers.isEmpty {
+                self.streamWarmupStartTimes.removeAll()
+                return
+            }
+            let count = self.streamWarmupPlayers.count
+            for (_, warmer) in self.streamWarmupPlayers {
+                warmer.pause()
+                warmer.replaceCurrentItem(with: nil)
+            }
+            self.streamWarmupPlayers.removeAll()
+            self.streamWarmupStartTimes.removeAll()
+            print("[TrackPlayer] warmup: 🧹 cleared \(count) player(s), reason=\(reason)")
+        }
+    }
+
     private func getPlaybackStateErrorKeyValues() -> Dictionary<String, Any> {
         switch player.playbackError {
             case .failedToLoadKeyValue: return [
@@ -939,8 +1154,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     // MARK: - QueuedAudioPlayer Event Handlers
 
     func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
+        // PATCHED: Log state changes for background audio debugging
+        NSLog("[RNTrackPlayer] 🔊 State → %@ | index=%d time=%.1f duration=%.1f playWhenReady=%d",
+              "\(state)", player.currentIndex, player.currentTime, player.duration, player.playWhenReady ? 1 : 0)
+        
         emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
         if (state == .ended) {
+            NSLog("[RNTrackPlayer] 🔊 Queue ended at index=%d position=%.1f", player.currentIndex, player.currentTime)
             emit(event: EventType.PlaybackQueueEnded, body: [
                 "track": player.currentIndex,
                 "position": player.currentTime,
@@ -970,6 +1190,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     }
 
     func handleAudioPlayerFailed(error: Error?) {
+        NSLog("[RNTrackPlayer] ❌ PLAYBACK FAILED: %@", error?.localizedDescription ?? "unknown")
         emit(event: EventType.PlaybackError, body: ["error": error?.localizedDescription])
     }
 
@@ -980,6 +1201,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         lastIndex: Int?,
         lastPosition: Double?
     ) {
+        NSLog("[RNTrackPlayer] 🔊 Track change: %@ → %@, lastPos=%.1f",
+              lastIndex != nil ? "\(lastIndex!)" : "nil",
+              index != nil ? "\(index!)" : "nil",
+              lastPosition ?? 0)
 
         if let item = item {
             DispatchQueue.main.async {
@@ -989,6 +1214,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             if self.player.automaticallyUpdateNowPlayingInfo {
                 let isTrackLiveStream = (item as? Track)?.isLiveStream ?? false
                 self.player.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
+            }
+            if let activeTrack = item as? Track {
+                let cacheKey = activeTrack.getSourceUrl()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.stopStreamWarmup(
+                        for: cacheKey,
+                        reason: "activated-cleanup",
+                        trackIndex: index
+                    )
+                }
             }
         }
         // IMPORTANT: Do NOT call endReceivingRemoteControlEvents when item becomes nil.

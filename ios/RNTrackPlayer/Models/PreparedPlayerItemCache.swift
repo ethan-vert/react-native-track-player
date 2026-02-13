@@ -17,6 +17,7 @@ import AVFoundation
 @objc(PreparedPlayerItemCache)
 public class PreparedPlayerItemCache: NSObject {
     @objc public static let shared = PreparedPlayerItemCache()
+    public static var beforeRetrieve: ((String) -> Void)?
     
     private var cache: [String: AVPlayerItem] = [:]
     private let queue = DispatchQueue(label: "PreparedPlayerItemCache", attributes: .concurrent)
@@ -29,24 +30,47 @@ public class PreparedPlayerItemCache: NSObject {
     @objc public func store(_ item: AVPlayerItem, forURL url: String) {
         queue.async(flags: .barrier) {
             self.cache[url] = item
-            print("[PreparedPlayerItemCache] Stored item for: \(url) (total: \(self.cache.count))")
         }
     }
     
     /// Retrieve and remove a prepared AVPlayerItem for a URL
     /// Returns nil if no prepared item exists
     @objc public func retrieve(forURL url: String) -> AVPlayerItem? {
+        // Allow RNTrackPlayer to detach any warmup AVPlayer holding this item
+        // before AVPlayerWrapper attaches it to the active AVPlayer.
+        let shortUrl = url.count > 80 ? String(url.prefix(80)) + "..." : url
+        print("[PreparedCache] ↔️ beforeRetrieve hook: \(PreparedPlayerItemCache.beforeRetrieve == nil ? "nil" : "set") url=\(shortUrl)")
+        PreparedPlayerItemCache.beforeRetrieve?(url)
+
         var item: AVPlayerItem?
-        queue.sync {
-            item = self.cache[url]
+        queue.sync(flags: .barrier) {
+            item = self.cache.removeValue(forKey: url)
         }
-        if item != nil {
-            queue.async(flags: .barrier) {
-                self.cache.removeValue(forKey: url)
-                print("[PreparedPlayerItemCache] ✅ Retrieved prepared item for: \(url) (remaining: \(self.cache.count))")
-            }
+        if let found = item {
+            let ranges = found.loadedTimeRanges.compactMap { $0.timeRangeValue }
+            let rangesStr = ranges.enumerated().map { idx, range in
+                let start = CMTimeGetSeconds(range.start)
+                let dur = CMTimeGetSeconds(range.duration)
+                let end = CMTimeGetSeconds(range.end)
+                return "#\(idx){\(String(format: "%.2f", start))→\(String(format: "%.2f", end)) d=\(String(format: "%.2f", dur))}"
+            }.joined(separator: ", ")
+            let firstBuffered = ranges.first.map { CMTimeGetSeconds($0.duration) } ?? 0
+            let totalBuffered = ranges.reduce(0.0) { acc, r in acc + max(0, CMTimeGetSeconds(r.duration)) }
+            let dur = found.duration
+            let durStr = CMTIME_IS_INDEFINITE(dur) || CMTIME_IS_INVALID(dur)
+                ? "indefinite"
+                : String(format: "%.2fs", CMTimeGetSeconds(dur))
+            let accessEvents = found.accessLog()?.events.count ?? 0
+            print(
+                "[PreparedCache] ✅ HIT url=\(shortUrl) " +
+                "status=\(found.status.rawValue) keepUp=\(found.isPlaybackLikelyToKeepUp) " +
+                "bufEmpty=\(found.isPlaybackBufferEmpty) bufFull=\(found.isPlaybackBufferFull) " +
+                "first=\(String(format: "%.2f", firstBuffered))s total=\(String(format: "%.2f", totalBuffered))s " +
+                "ranges=[\(rangesStr.isEmpty ? "none" : rangesStr)] dur=\(durStr) accessEvents=\(accessEvents)"
+            )
         } else {
-            print("[PreparedPlayerItemCache] No prepared item for: \(url)")
+            let shortUrl = url.count > 80 ? String(url.prefix(80)) + "..." : url
+            print("[PreparedCache] ❌ MISS — \(shortUrl)")
         }
         return item
     }
@@ -59,13 +83,18 @@ public class PreparedPlayerItemCache: NSObject {
         }
         return exists
     }
+
+    /// Remove a prepared item for a URL (if present)
+    @objc public func remove(forURL url: String) {
+        queue.sync(flags: .barrier) {
+            self.cache.removeValue(forKey: url)
+        }
+    }
     
     /// Clear all cached items
     @objc public func clear() {
         queue.async(flags: .barrier) {
-            let count = self.cache.count
             self.cache.removeAll()
-            print("[PreparedPlayerItemCache] Cleared \(count) item(s)")
         }
     }
     
