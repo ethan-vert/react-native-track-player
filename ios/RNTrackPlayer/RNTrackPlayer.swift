@@ -33,6 +33,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     // Hidden warmup players that drive network reads for upcoming stream-chunk items.
     private var streamWarmupPlayers: [String: AVPlayer] = [:]
     private var streamWarmupStartTimes: [String: Date] = [:]
+    private let enableStreamWarmupPlayers = false
     private let streamWarmupTargetSeconds: Double = 1.5
     private let streamWarmupPollIntervalSeconds: Double = 0.25
     private let streamWarmupMaxWaitSeconds: Double = 25.0
@@ -43,9 +44,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
         audioSessionController.delegate = self
-        PreparedPlayerItemCache.beforeRetrieve = { [weak self] url in
-            _ = self?.detachStreamWarmupBestEffort(for: url, reason: "handoff")
-        }
+        PreparedPlayerItemCache.beforeRetrieve = enableStreamWarmupPlayers
+            ? { [weak self] url in
+                _ = self?.detachStreamWarmupBestEffort(for: url, reason: "handoff")
+            }
+            : nil
         player.playWhenReady = false;
         player.event.receiveChapterMetadata.addListener(self, handleAudioPlayerChapterMetadataReceived)
         player.event.receiveTimedMetadata.addListener(self, handleAudioPlayerTimedMetadataReceived)
@@ -466,7 +469,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             // for the same chunk, which causes duplicate generation and unstable playback.
             if isStreamChunk {
                 let currentIndex = player.currentIndex
-                let shouldWarm = currentIndex >= 0 && trackInsertionIndex > currentIndex
+                let shouldWarm = enableStreamWarmupPlayers && currentIndex >= 0 && trackInsertionIndex > currentIndex
                 if shouldWarm {
                     // Use a separate AVPlayerItem for warmup so the cached playback
                     // item is never attached to more than one AVPlayer.
@@ -1215,7 +1218,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 let isTrackLiveStream = (item as? Track)?.isLiveStream ?? false
                 self.player.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
             }
-            if let activeTrack = item as? Track {
+            if enableStreamWarmupPlayers, let activeTrack = item as? Track {
                 let cacheKey = activeTrack.getSourceUrl()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                     self?.stopStreamWarmup(
